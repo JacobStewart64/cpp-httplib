@@ -11,6 +11,10 @@ work either!
 So for all intents and purposes I think it works unless you plan on stopping
 and restarting the server.
 
+The design is almost A+ I think. I could scale accept more, and maybe
+splitting the 1 worker function into a couple different ones would
+improve it! + other minor things
+
 cpp-httplib
 ===========
 
