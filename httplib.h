@@ -51,6 +51,10 @@ typedef SOCKET socket_t;
 #include <sys/socket.h>
 #include <sys/select.h>
 
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/stat.h>
+
 typedef int socket_t;
 #define INVALID_SOCKET (-1)
 #endif //_WIN32
@@ -83,6 +87,18 @@ typedef int socket_t;
 
 namespace httplib
 {
+    void signal_handler(int sig)
+    {
+        sig = sig;
+    }
+
+    /* Wrapper to set a signal handler */
+    int signal_handler_set(int sig,  void(*handler)(int))
+    {
+        struct sigaction sa = { 0 };
+        sa.sa_handler = handler;
+        return sigaction(sig, &sa, NULL);
+    }
 
 namespace detail {
 
@@ -229,6 +245,7 @@ private:
 
     socket_t create_server_socket(const char* host, int port, int socket_flags) const;
     int bind_internal(const char* host, int port, int socket_flags);
+    void worker();
     bool listen_internal();
 
     bool routing(Request& req, Response& res);
@@ -252,8 +269,10 @@ private:
     Logger      logger_;
 
     // TODO: Use thread pool...
-    std::mutex  running_threads_mutex_;
-    int         running_threads_;
+    int epoll_fd_;
+    int n_cores_;
+    bool shutdown_threads_;
+    std::thread thread_pool_[8];
 };
 
 class Client {
@@ -499,16 +518,43 @@ inline bool wait_until_socket_is_ready(socket_t sock, time_t sec, time_t usec)
 }
 
 template <typename T>
-inline bool read_and_close_socket(socket_t sock, size_t keep_alive_max_count, T callback)
+inline bool read_and_close_socket_client(socket_t sock, size_t keep_alive_max_count, T callback)
 {
     bool ret = false;
-
     if (keep_alive_max_count > 0) {
         auto count = keep_alive_max_count;
         while (count > 0 &&
                detail::select_read(sock,
                    CPPHTTPLIB_KEEPALIVE_TIMEOUT_SECOND,
                    CPPHTTPLIB_KEEPALIVE_TIMEOUT_USECOND) > 0) {
+            SocketStream strm(sock);
+            auto last_connection = count == 1;
+            auto connection_close = false;
+
+            ret = callback(strm, last_connection, connection_close);
+            if (!ret || connection_close) {
+                break;
+            }
+
+            count--;
+        }
+    } else {
+        SocketStream strm(sock);
+        auto dummy_connection_close = false;
+        ret = callback(strm, true, dummy_connection_close);
+    }
+
+    close_socket(sock);
+    return ret;
+}
+
+template <typename T>
+inline bool read_and_close_socket(socket_t sock, size_t keep_alive_max_count, T callback)
+{
+    bool ret = false;
+    if (keep_alive_max_count > 0) {
+        auto count = keep_alive_max_count;
+        while (count > 0) {
             SocketStream strm(sock);
             auto last_connection = count == 1;
             auto connection_close = false;
@@ -1308,6 +1354,42 @@ inline std::pair<std::string, std::string> make_range_header(uint64_t value, Arg
     return std::make_pair("Range", field);
 }
 
+bool checkerrno(int fd,
+  const char* file,
+  int line)
+{
+  
+  if(fd == -1)
+  {
+
+    char command[10];
+    sprintf(command,
+      "errno %d",
+      errno);
+
+    fprintf(stderr,
+      "%s:%d\n",
+      file,
+      line);
+
+    std::system(command);
+    return false;
+  }
+
+  return true;
+}
+
+#define checkerrno(x) checkerrno(x, __FILE__, __LINE__)
+
+long num_cores()
+{
+
+  long nprocs = -1;
+  nprocs = sysconf(_SC_NPROCESSORS_ONLN);
+  checkerrno(nprocs);
+  return nprocs;
+}
+
 // Request implementation
 inline bool Request::has_header(const char* key) const
 {
@@ -1450,7 +1532,6 @@ inline Server::Server()
     : keep_alive_max_count_(5)
     , is_running_(false)
     , svr_sock_(INVALID_SOCKET)
-    , running_threads_(0)
 {
 #ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
@@ -1544,6 +1625,21 @@ inline void Server::stop()
         svr_sock_ = INVALID_SOCKET;
         detail::shutdown_socket(sock);
         detail::close_socket(sock);
+
+        signal_handler_set(SIGCHLD, signal_handler);
+
+        //make so I don't get signals in main thread
+        //sigset_t sig_set;
+        //checkerrno(sigaddset(&sig_set, SIGCHLD));
+        //checkerrno(sigprocmask(SIG_SETMASK, &sig_set, 0));
+
+        shutdown_threads_ = true;
+
+        //send signal to end all threadzor!
+        for (int i = 0; i < n_cores_; ++i)
+        {
+            kill(thread_pool_[i].native_handle(), SIGCHLD); 
+        }
     }
 }
 
@@ -1713,60 +1809,136 @@ inline int Server::bind_internal(const char* host, int port, int socket_flags)
     }
 }
 
+void Server::worker()
+{
+
+  epoll_event event;
+
+  while (true)
+  {
+
+    if (shutdown_threads_)
+    {
+        return;
+    }
+
+    int num_events = epoll_wait(epoll_fd_,
+      &event,
+      1,
+      -1);
+
+    //am I signalled to shutdown?
+    if (num_events == -1)
+    {
+        if (EINTR == errno)
+        {
+            if (shutdown_threads_)
+            {
+                return;
+            }
+        }
+    }
+    
+    if (checkerrno(num_events))
+    {
+
+      if (event.data.fd == svr_sock_)
+      {
+        //fprintf(stderr,
+          //"posting accept\n");
+        int new_connect_fd = accept(svr_sock_,
+          0, //&addr_in
+          0);//&addrlen
+        
+        if (checkerrno(new_connect_fd))
+        {
+          //fprintf(stderr,
+            //"successful accept!\n");
+          epoll_event event;
+          event.events = EPOLLIN | EPOLLONESHOT;
+          event.data.fd = new_connect_fd;
+
+          checkerrno(
+            epoll_ctl(epoll_fd_,
+            EPOLL_CTL_ADD,
+            new_connect_fd,
+            &event));
+        }
+
+        epoll_event new_event;
+        new_event.events = EPOLLIN | EPOLLONESHOT;
+        new_event.data.fd = svr_sock_;
+
+        checkerrno(epoll_ctl(epoll_fd_,
+          EPOLL_CTL_MOD,
+          svr_sock_,
+          &new_event));
+      }
+      else
+      { 
+
+        //fprintf(stderr,
+          //"posting receive\n");
+        read_and_close_socket(event.data.fd);
+      }
+    }
+  }
+}
+
 inline bool Server::listen_internal()
 {
     auto ret = true;
 
     is_running_ = true;
+    shutdown_threads_ = false;
 
-    for (;;) {
-        auto val = detail::select_read(svr_sock_, 0, 100000);
+    //get number of cores * 2
+    n_cores_ = num_cores() * 2;
 
-        if (val == 0) { // Timeout
-            if (svr_sock_ == INVALID_SOCKET) {
-                // The server socket was closed by 'stop' method.
-                break;
-            }
-            continue;
-        }
+    //create epoll system object
+    epoll_fd_ = epoll_create1(0);
+    checkerrno(epoll_fd_);
+    
+    //set listen_socket to look for
+    //opportunity to accept
+    epoll_event event;
+    event.events = EPOLLIN | EPOLLONESHOT;
+    event.data.fd = svr_sock_;
 
-        socket_t sock = accept(svr_sock_, NULL, NULL);
+    checkerrno(
+        epoll_ctl(epoll_fd_,
+        EPOLL_CTL_ADD,
+        svr_sock_,
+        &event));
 
-        if (sock == INVALID_SOCKET) {
-            if (svr_sock_ != INVALID_SOCKET) {
-                detail::close_socket(svr_sock_);
-                ret = false;
-            } else {
-                ; // The server socket was closed by user.
-            }
-            break;
-        }
-
-        // TODO: Use thread pool...
-        std::thread([=]() {
-            {
-                std::lock_guard<std::mutex> guard(running_threads_mutex_);
-                running_threads_++;
-            }
-
-            read_and_close_socket(sock);
-
-            {
-                std::lock_guard<std::mutex> guard(running_threads_mutex_);
-                running_threads_--;
-            }
-        }).detach();
+    //kickoff threads
+    //a few globals are used in each thread
+    //in readonly way
+    for (int i = 0; i < n_cores_; ++i)
+    {
+        thread_pool_[i] = std::thread(std::bind(&Server::worker, this));
     }
 
-    // TODO: Use thread pool...
-    for (;;) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        std::lock_guard<std::mutex> guard(running_threads_mutex_);
-        if (!running_threads_) {
-            break;
-        }
+    //block on this listen call
+    //the thread handling
+    //the listen socket
+    //will throw some errors
+    //on start. For now it doesn't
+    //cause any problems and is ignored
+    ::listen(svr_sock_,
+        10000);
+
+    //wait for threads to be signalled to exit
+    //there is no mechanism for this yet
+    for (int i = 0; i < n_cores_; ++i)
+    {
+        thread_pool_[i].join();
     }
 
+    //close epoll
+    checkerrno(close(epoll_fd_));
+
+    shutdown_threads_ = false;
     is_running_ = false;
 
     return ret;
@@ -2056,7 +2228,7 @@ inline bool Client::process_request(Stream& strm, Request& req, Response& res, b
 
 inline bool Client::read_and_close_socket(socket_t sock, Request& req, Response& res)
 {
-    return detail::read_and_close_socket(
+    return detail::read_and_close_socket_client(
         sock,
         0,
         [&](Stream& strm, bool /*last_connection*/, bool& connection_close) {
@@ -2204,7 +2376,7 @@ inline std::shared_ptr<Response> Client::Options(const char* path, const Headers
 namespace detail {
 
 template <typename U, typename V, typename T>
-inline bool read_and_close_socket_ssl(
+inline bool read_and_close_socket_ssl_client(
     socket_t sock, size_t keep_alive_max_count,
     // TODO: OpenSSL 1.0.2 occasionally crashes...
     // The upcoming 1.1.0 is going to be thread safe.
@@ -2237,6 +2409,66 @@ inline bool read_and_close_socket_ssl(
                detail::select_read(sock,
                    CPPHTTPLIB_KEEPALIVE_TIMEOUT_SECOND,
                    CPPHTTPLIB_KEEPALIVE_TIMEOUT_USECOND) > 0) {
+            SSLSocketStream strm(sock, ssl);
+            auto last_connection = count == 1;
+            auto connection_close = false;
+
+            ret = callback(strm, last_connection, connection_close);
+            if (!ret || connection_close) {
+                break;
+            }
+
+            count--;
+        }
+    } else {
+        SSLSocketStream strm(sock, ssl);
+        auto dummy_connection_close = false;
+        ret = callback(strm, true, dummy_connection_close);
+    }
+
+    SSL_shutdown(ssl);
+
+    {
+        std::lock_guard<std::mutex> guard(ctx_mutex);
+        SSL_free(ssl);
+    }
+
+    close_socket(sock);
+
+    return ret;
+}
+
+template <typename U, typename V, typename T>
+inline bool read_and_close_socket_ssl(
+    socket_t sock, size_t keep_alive_max_count,
+    // TODO: OpenSSL 1.0.2 occasionally crashes...
+    // The upcoming 1.1.0 is going to be thread safe.
+    SSL_CTX* ctx, std::mutex& ctx_mutex,
+    U SSL_connect_or_accept, V setup,
+    T callback)
+{
+    SSL* ssl = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(ctx_mutex);
+
+        ssl = SSL_new(ctx);
+        if (!ssl) {
+            return false;
+        }
+    }
+
+    auto bio = BIO_new_socket(sock, BIO_NOCLOSE);
+    SSL_set_bio(ssl, bio, bio);
+
+    setup(ssl);
+
+    SSL_connect_or_accept(ssl);
+
+    bool ret = false;
+
+    if (keep_alive_max_count > 0) {
+        auto count = keep_alive_max_count;
+        while (count > 0) {
             SSLSocketStream strm(sock, ssl);
             auto last_connection = count == 1;
             auto connection_close = false;
@@ -2376,7 +2608,7 @@ inline bool SSLClient::is_valid() const
 
 inline bool SSLClient::read_and_close_socket(socket_t sock, Request& req, Response& res)
 {
-    return is_valid() && detail::read_and_close_socket_ssl(
+    return is_valid() && detail::read_and_close_socket_ssl_client(
         sock, 0,
         ctx_, ctx_mutex_,
         SSL_connect,

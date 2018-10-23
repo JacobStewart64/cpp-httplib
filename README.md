@@ -1,3 +1,16 @@
+Fork Notes: Added Linux epoll w/ threadpool
+
+It seems like everything works! Success for once!
+
+Only problem is I can't get my signals to close worker threads
+without pausing and continuing in the debugger.
+
+Running the program compiled in release mode from the command line doesn't
+work either!
+
+So for all intents and purposes I think it works unless you plan on stopping
+and restarting the server.
+
 cpp-httplib
 ===========
 
