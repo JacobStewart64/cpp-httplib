@@ -95,8 +95,9 @@ namespace httplib
     /* Wrapper to set a signal handler */
     int signal_handler_set(int sig,  void(*handler)(int))
     {
-        struct sigaction sa = { 0 };
+        struct sigaction sa;
         sa.sa_handler = handler;
+
         return sigaction(sig, &sa, NULL);
     }
 
@@ -1626,19 +1627,14 @@ inline void Server::stop()
         detail::shutdown_socket(sock);
         detail::close_socket(sock);
 
-        signal_handler_set(SIGCHLD, signal_handler);
-
-        //make so I don't get signals in main thread
-        //sigset_t sig_set;
-        //checkerrno(sigaddset(&sig_set, SIGCHLD));
-        //checkerrno(sigprocmask(SIG_SETMASK, &sig_set, 0));
+        signal_handler_set(SIGINT, signal_handler);
 
         shutdown_threads_ = true;
 
         //send signal to end all threadzor!
         for (int i = 0; i < n_cores_; ++i)
         {
-            kill(thread_pool_[i].native_handle(), SIGCHLD); 
+            pthread_kill(thread_pool_[i].native_handle(), SIGINT); 
         }
     }
 }

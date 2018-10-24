@@ -455,7 +455,6 @@ protected:
     }
 
     virtual void TearDown() {
-        msleep(1000);
         svr_.stop();
         for (auto& t: request_threads_) {
             t.join();
@@ -1008,7 +1007,6 @@ protected:
     }
 
     virtual void TearDown() {
-        msleep(1000);
         svr_.stop();
         t_.join();
     }
@@ -1051,7 +1049,6 @@ protected:
     }
 
     virtual void TearDown() {
-        msleep(1000);
         svr_.stop();
         t_.join();
     }
