@@ -1840,16 +1840,14 @@ void Server::worker()
 
       if (event.data.fd == svr_sock_)
       {
-        //fprintf(stderr,
-          //"posting accept\n");
+
         int new_connect_fd = accept(svr_sock_,
           0, //&addr_in
           0);//&addrlen
         
         if (checkerrno(new_connect_fd))
         {
-          //fprintf(stderr,
-            //"successful accept!\n");
+
           epoll_event event;
           event.events = EPOLLIN | EPOLLONESHOT;
           event.data.fd = new_connect_fd;
@@ -1873,8 +1871,6 @@ void Server::worker()
       else
       { 
 
-        //fprintf(stderr,
-          //"posting receive\n");
         read_and_close_socket(event.data.fd);
       }
     }
@@ -1908,24 +1904,15 @@ inline bool Server::listen_internal()
         &event));
 
     //kickoff threads
-    //a few globals are used in each thread
-    //in readonly way
     for (int i = 0; i < n_cores_; ++i)
     {
         thread_pool_[i] = std::thread(std::bind(&Server::worker, this));
     }
 
-    //block on this listen call
-    //the thread handling
-    //the listen socket
-    //will throw some errors
-    //on start. For now it doesn't
-    //cause any problems and is ignored
     ::listen(svr_sock_,
         10000);
 
     //wait for threads to be signalled to exit
-    //there is no mechanism for this yet
     for (int i = 0; i < n_cores_; ++i)
     {
         thread_pool_[i].join();
