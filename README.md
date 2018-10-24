@@ -1,19 +1,8 @@
 Fork Notes: Added Linux epoll w/ threadpool
 
-It seems like everything works! Success for once!
+100% tests passed with all flags!
 
-Only problem is I can't get my signals to close worker threads
-without pausing and continuing in the debugger.
-
-Running the program compiled in release mode from the command line doesn't
-work either!
-
-So for all intents and purposes I think it works unless you plan on stopping
-and restarting the server.
-
-The design is almost A+ I think. I could scale accept more, and maybe
-splitting the 1 worker function into a couple different ones would
-improve it! + other minor things
+Will work on perfecting the performance now!
 
 cpp-httplib
 ===========
