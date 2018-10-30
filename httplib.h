@@ -54,6 +54,7 @@ typedef SOCKET socket_t;
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/stat.h>
+#include <mutex>
 
 typedef int socket_t;
 #define INVALID_SOCKET (-1)
@@ -62,6 +63,7 @@ typedef int socket_t;
 #include <fstream>
 #include <functional>
 #include <map>
+#include <unordered_map>
 #include <memory>
 #include <mutex>
 #include <regex>
@@ -87,19 +89,6 @@ typedef int socket_t;
 
 namespace httplib
 {
-    void signal_handler(int sig)
-    {
-        sig = sig;
-    }
-
-    /* Wrapper to set a signal handler */
-    int signal_handler_set(int sig,  void(*handler)(int))
-    {
-        struct sigaction sa;
-        sa.sa_handler = handler;
-
-        return sigaction(sig, &sa, NULL);
-    }
 
 namespace detail {
 
@@ -274,6 +263,9 @@ private:
     int n_cores_;
     bool shutdown_threads_;
     std::thread thread_pool_[8];
+    std::mutex threads_mutex_;
+    std::unordered_map<std::thread::id, bool> thread_is_running_;
+    std::unordered_map<std::thread::id, __gthread_t> native_handles_;
 };
 
 class Client {
@@ -1355,39 +1347,12 @@ inline std::pair<std::string, std::string> make_range_header(uint64_t value, Arg
     return std::make_pair("Range", field);
 }
 
-bool checkerrno(int fd,
-  const char* file,
-  int line)
-{
-  
-  if(fd == -1)
-  {
-
-    char command[10];
-    sprintf(command,
-      "errno %d",
-      errno);
-
-    fprintf(stderr,
-      "%s:%d\n",
-      file,
-      line);
-
-    std::system(command);
-    return false;
-  }
-
-  return true;
-}
-
-#define checkerrno(x) checkerrno(x, __FILE__, __LINE__)
 
 long num_cores()
 {
 
   long nprocs = -1;
   nprocs = sysconf(_SC_NPROCESSORS_ONLN);
-  checkerrno(nprocs);
   return nprocs;
 }
 
@@ -1621,21 +1586,17 @@ inline bool Server::is_running() const
 inline void Server::stop()
 {
     if (is_running_) {
+        //wait for threads to have started at least
+        while (thread_is_running_.size() < n_cores_ &&
+          native_handles_.size() < n_cores_) {}
+
+        shutdown_threads_ = true;
+
         assert(svr_sock_ != INVALID_SOCKET);
         auto sock = svr_sock_;
         svr_sock_ = INVALID_SOCKET;
         detail::shutdown_socket(sock);
         detail::close_socket(sock);
-
-        signal_handler_set(SIGINT, signal_handler);
-
-        shutdown_threads_ = true;
-
-        //send signal to end all threadzor!
-        for (int i = 0; i < n_cores_; ++i)
-        {
-            pthread_kill(thread_pool_[i].native_handle(), SIGINT); 
-        }
     }
 }
 
@@ -1658,7 +1619,7 @@ inline bool Server::parse_request_line(const char* s, Request& req)
 
         return true;
     }
-
+    
     return false;
 }
 
@@ -1807,70 +1768,53 @@ inline int Server::bind_internal(const char* host, int port, int socket_flags)
 
 void Server::worker()
 {
+  threads_mutex_.lock();
+  thread_is_running_.insert(std::pair<std::thread::id, bool>(std::this_thread::get_id(), true));
+  threads_mutex_.unlock();
 
   epoll_event event;
 
   while (true)
   {
-
-    if (shutdown_threads_)
-    {
-        return;
-    }
-
+    //wait for fd to be readable
     int num_events = epoll_wait(epoll_fd_,
       &event,
       1,
-      -1);
+      250);
 
-    //am I signalled to shutdown?
-    if (num_events == -1)
+    if (shutdown_threads_)
     {
-        if (EINTR == errno)
-        {
-            if (shutdown_threads_)
-            {
-                return;
-            }
-        }
+      return;
     }
-    
-    if (checkerrno(num_events))
-    {
 
+    if (num_events > 0)
+    {
       if (event.data.fd == svr_sock_)
       {
-
         int new_connect_fd = accept(svr_sock_,
           0, //&addr_in
           0);//&addrlen
-        
-        if (checkerrno(new_connect_fd))
-        {
 
-          epoll_event event;
-          event.events = EPOLLIN | EPOLLONESHOT;
-          event.data.fd = new_connect_fd;
+        epoll_event event;
+        event.events = EPOLLIN | EPOLLONESHOT;
+        event.data.fd = new_connect_fd;
 
-          checkerrno(
-            epoll_ctl(epoll_fd_,
-            EPOLL_CTL_ADD,
-            new_connect_fd,
-            &event));
-        }
+        epoll_ctl(epoll_fd_,
+          EPOLL_CTL_ADD,
+          new_connect_fd,
+          &event);
 
         epoll_event new_event;
         new_event.events = EPOLLIN | EPOLLONESHOT;
         new_event.data.fd = svr_sock_;
 
-        checkerrno(epoll_ctl(epoll_fd_,
+        epoll_ctl(epoll_fd_,
           EPOLL_CTL_MOD,
           svr_sock_,
-          &new_event));
+          &new_event);
       }
       else
       { 
-
         read_and_close_socket(event.data.fd);
       }
     }
@@ -1889,7 +1833,6 @@ inline bool Server::listen_internal()
 
     //create epoll system object
     epoll_fd_ = epoll_create1(0);
-    checkerrno(epoll_fd_);
     
     //set listen_socket to look for
     //opportunity to accept
@@ -1897,20 +1840,21 @@ inline bool Server::listen_internal()
     event.events = EPOLLIN | EPOLLONESHOT;
     event.data.fd = svr_sock_;
 
-    checkerrno(
-        epoll_ctl(epoll_fd_,
-        EPOLL_CTL_ADD,
-        svr_sock_,
-        &event));
+    epoll_ctl(epoll_fd_,
+      EPOLL_CTL_ADD,
+      svr_sock_,
+      &event);
+    
+
+    ::listen(svr_sock_,
+        10000);
 
     //kickoff threads
     for (int i = 0; i < n_cores_; ++i)
     {
         thread_pool_[i] = std::thread(std::bind(&Server::worker, this));
+        native_handles_.insert(std::pair<std::thread::id, __gthread_t>(thread_pool_[i].get_id(), thread_pool_[i].native_handle()));
     }
-
-    ::listen(svr_sock_,
-        10000);
 
     //wait for threads to be signalled to exit
     for (int i = 0; i < n_cores_; ++i)
@@ -1918,8 +1862,11 @@ inline bool Server::listen_internal()
         thread_pool_[i].join();
     }
 
+    thread_is_running_.clear();
+    native_handles_.clear();
+
     //close epoll
-    checkerrno(close(epoll_fd_));
+    close(epoll_fd_);
 
     shutdown_threads_ = false;
     is_running_ = false;
