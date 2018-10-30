@@ -263,9 +263,6 @@ private:
     int n_cores_;
     bool shutdown_threads_;
     std::thread thread_pool_[8];
-    std::mutex threads_mutex_;
-    std::unordered_map<std::thread::id, bool> thread_is_running_;
-    std::unordered_map<std::thread::id, __gthread_t> native_handles_;
 };
 
 class Client {
@@ -1586,10 +1583,6 @@ inline bool Server::is_running() const
 inline void Server::stop()
 {
     if (is_running_) {
-        //wait for threads to have started at least
-        while (thread_is_running_.size() < n_cores_ &&
-          native_handles_.size() < n_cores_) {}
-
         shutdown_threads_ = true;
 
         assert(svr_sock_ != INVALID_SOCKET);
@@ -1768,10 +1761,6 @@ inline int Server::bind_internal(const char* host, int port, int socket_flags)
 
 void Server::worker()
 {
-  threads_mutex_.lock();
-  thread_is_running_.insert(std::pair<std::thread::id, bool>(std::this_thread::get_id(), true));
-  threads_mutex_.unlock();
-
   epoll_event event;
 
   while (true)
@@ -1853,7 +1842,6 @@ inline bool Server::listen_internal()
     for (int i = 0; i < n_cores_; ++i)
     {
         thread_pool_[i] = std::thread(std::bind(&Server::worker, this));
-        native_handles_.insert(std::pair<std::thread::id, __gthread_t>(thread_pool_[i].get_id(), thread_pool_[i].native_handle()));
     }
 
     //wait for threads to be signalled to exit
@@ -1861,9 +1849,6 @@ inline bool Server::listen_internal()
     {
         thread_pool_[i].join();
     }
-
-    thread_is_running_.clear();
-    native_handles_.clear();
 
     //close epoll
     close(epoll_fd_);
